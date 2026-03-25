@@ -6,13 +6,13 @@
 const BREVO_API_KEY = process.env.BREVO_API_KEY || ''
 const BASE_URL = 'https://api.brevo.com/v3'
 
-// ── Brevo list IDs — update these after creating lists in Brevo dashboard ──
+// ── Brevo list IDs (created 2026-03-25) ────────────────────────────────────
 export const BREVO_LISTS = {
-  ACTIVE_CUSTOMERS:    1,   // shipped < 30 days
-  LAPSED_CUSTOMERS:    2,   // shipped > 30d, health < 40
-  WARM_LEADS:          3,   // signed up, never shipped
-  COLD_CSV:            4,   // CSV import, no prior relationship
-  ALL_CONTACTS:        5,   // master list
+  ACTIVE_CUSTOMERS:    3,   // shipped < 30 days
+  LAPSED_CUSTOMERS:    4,   // shipped > 30d, health < 40
+  WARM_LEADS:          5,   // signed up, never shipped
+  COLD_CSV:            6,   // CSV import, no prior relationship
+  ALL_CONTACTS:        7,   // master list
 } as const
 
 export type BrevoListId = (typeof BREVO_LISTS)[keyof typeof BREVO_LISTS]
