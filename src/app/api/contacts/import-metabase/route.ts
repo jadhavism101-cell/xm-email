@@ -115,8 +115,9 @@ export async function POST() {
     .select('seller_id, phone, whatsapp, business_name, city, state, customer_tier, email')
     .in('seller_id', vendorIds)
 
-  const metaByVendorId = new Map<number, typeof metaRows extends Array<infer T> ? T : never>()
-  for (const m of metaRows || []) {
+  type MetaRow = { seller_id: number; phone: string | null; whatsapp: string | null; business_name: string | null; city: string | null; state: string | null; customer_tier: string | null; email: string | null }
+  const metaByVendorId = new Map<number, MetaRow>()
+  for (const m of (metaRows || []) as MetaRow[]) {
     metaByVendorId.set(m.seller_id, m)
   }
 
