@@ -26,6 +26,7 @@ export function isValidRole(r: string): r is XmRole {
 }
 
 export const AUTH_COOKIE_NAME = 'xm-auth' as const
+export const AUTH_ROLE_COOKIE_NAME = 'xm-role' as const
 
 export interface XmUserProfile {
   id: string

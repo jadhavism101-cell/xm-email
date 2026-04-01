@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase'
+import { requireDashboardRole } from '@/lib/api-security'
 
 export const dynamic = 'force-dynamic'
 
@@ -48,7 +50,10 @@ function validateEmail(email: string): { valid: boolean; reason?: string } {
   return { valid: true }
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
+  const forbidden = requireDashboardRole(req, 'ops')
+  if (forbidden) return forbidden
+
   const formData = await req.formData()
   const file = formData.get('file') as File | null
   const batchName = (formData.get('batch_name') as string | null) || `csv_import_${new Date().toISOString().slice(0, 10)}`

@@ -1,7 +1,12 @@
+"use client"
+
+import { useEffect, useState } from 'react'
+
 export const dynamic = 'force-dynamic'
 
 const SEGMENTS = [
   {
+    key: 'active_customer',
     name: 'Active Customers',
     description: 'Shipped in last 30 days',
     color: 'emerald',
@@ -9,6 +14,7 @@ const SEGMENTS = [
     sql: `contacts.type = 'customer' AND last shipment ≤ 30 days ago`,
   },
   {
+    key: 'lapsed_customer',
     name: 'Lapsed Customers',
     description: 'Shipped before, not in last 30–60 days, health score < 40',
     color: 'amber',
@@ -16,6 +22,7 @@ const SEGMENTS = [
     sql: `contacts.type = 'customer' AND health_score < 40 AND no shipment in 30d`,
   },
   {
+    key: 'warm_lead',
     name: 'Warm Leads',
     description: 'Signed up, never shipped, account age > 7 days',
     color: 'blue',
@@ -23,6 +30,7 @@ const SEGMENTS = [
     sql: `contacts.type = 'lead' AND no shipments AND created_at < 7 days ago`,
   },
   {
+    key: 'new_cold',
     name: 'Cold / CSV Import',
     description: 'Contacts not found in CRM — from manual CSV upload',
     color: 'violet',
@@ -39,6 +47,43 @@ const colorMap: Record<string, string> = {
 }
 
 export default function SegmentsPage() {
+  const [counts, setCounts] = useState<Record<string, number | null>>({
+    active_customer: null,
+    lapsed_customer: null,
+    warm_lead: null,
+    new_cold: null,
+  })
+  const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({})
+
+  async function loadAllCounts() {
+    try {
+      const res = await fetch('/api/contacts/segment-counts', { cache: 'no-store' })
+      const json = await res.json()
+      if (!res.ok || !json?.ok) return
+      setCounts((prev) => ({ ...prev, ...(json.counts || {}) }))
+    } catch {
+      // Keep placeholders on API errors.
+    }
+  }
+
+  async function runCount(segment: string) {
+    setLoadingMap((prev) => ({ ...prev, [segment]: true }))
+    try {
+      const res = await fetch(`/api/contacts/segment-counts?segment=${encodeURIComponent(segment)}`, {
+        cache: 'no-store',
+      })
+      const json = await res.json()
+      if (!res.ok || !json?.ok) return
+      setCounts((prev) => ({ ...prev, [segment]: Number(json.count || 0) }))
+    } finally {
+      setLoadingMap((prev) => ({ ...prev, [segment]: false }))
+    }
+  }
+
+  useEffect(() => {
+    loadAllCounts()
+  }, [])
+
   return (
     <div className="space-y-8">
       <div>
@@ -76,9 +121,15 @@ export default function SegmentsPage() {
             </div>
 
             <div className="flex items-center justify-between pt-1">
-              <span className="text-gray-600 text-xs">Count: —</span>
-              <button className="text-xs text-blue-400 hover:text-blue-300 transition-colors">
-                Run count →
+              <span className="text-gray-600 text-xs">
+                Count: {counts[seg.key] === null ? '—' : counts[seg.key]?.toLocaleString()}
+              </span>
+              <button
+                onClick={() => runCount(seg.key)}
+                disabled={!!loadingMap[seg.key]}
+                className="text-xs text-blue-400 hover:text-blue-300 transition-colors disabled:text-gray-600 disabled:cursor-not-allowed"
+              >
+                {loadingMap[seg.key] ? 'Counting...' : 'Run count →'}
               </button>
             </div>
           </div>

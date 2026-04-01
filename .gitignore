@@ -29,7 +29,15 @@ yarn-error.log*
 
 # vercel
 .vercel
+.env.vercel.inspect
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Sales data / lead sheets — must NEVER be committed to this repo.
+# These contain personal contact data (leads, customers).
+# Source of truth: Xtramiles Document/Sales Data/ on local machine only.
+Sales Data/
+*.xlsx
+*.csv

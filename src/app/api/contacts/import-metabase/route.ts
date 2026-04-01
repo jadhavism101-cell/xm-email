@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 import { queryMetabase } from '@/lib/metabase'
 import { getSupabaseAdmin } from '@/lib/supabase'
+import { requireDashboardRole } from '@/lib/api-security'
 
 export const dynamic = 'force-dynamic'
 
@@ -60,7 +62,10 @@ function classifyVendor(totalOrders: number, lastOrderDate: string | null): {
   }
 }
 
-export async function POST() {
+export async function POST(req: NextRequest) {
+  const forbidden = requireDashboardRole(req, 'ops')
+  if (forbidden) return forbidden
+
   const startedAt = new Date().toISOString()
   const supabase = getSupabaseAdmin()
 

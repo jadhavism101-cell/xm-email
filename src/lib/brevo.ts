@@ -5,6 +5,7 @@
 
 const BREVO_API_KEY = process.env.BREVO_API_KEY || ''
 const BASE_URL = 'https://api.brevo.com/v3'
+const BREVO_MAX_ATTEMPTS = 3
 
 // ── Brevo list IDs (created 2026-03-25) ────────────────────────────────────
 export const BREVO_LISTS = {
@@ -36,7 +37,7 @@ export interface BrevoContactResponse {
 }
 
 export interface BrevoWebhookEvent {
-  event: 'delivered' | 'opened' | 'clicked' | 'softBounce' | 'hardBounce' | 'unsubscribed' | 'spam'
+  event: 'delivered' | 'opened' | 'clicked' | 'click' | 'softBounce' | 'hardBounce' | 'unsubscribed' | 'spam'
   email: string
   messageId: string
   subject?: string
@@ -57,6 +58,71 @@ export interface BrevoImportResult {
   errors: { email: string; error: string }[]
 }
 
+export interface BrevoTemplateSummary {
+  id: number
+  name: string
+  subject: string | null
+  isActive: boolean | null
+  modifiedAt: string | null
+  createdAt: string | null
+}
+
+export interface BrevoSmtpTemplateUpsertInput {
+  name: string
+  subject: string
+  htmlContent: string
+  senderName: string
+  senderEmail: string
+  replyToEmail?: string | null
+  existingTemplateId?: number | null
+}
+
+export interface BrevoSmtpTemplateUpsertResult {
+  templateId: number
+  created: boolean
+}
+
+export interface BrevoWebhookSummary {
+  id: number
+  url: string
+  description?: string | null
+  events?: string[]
+  type?: string | null
+  channel?: string | null
+}
+
+export class BrevoApiError extends Error {
+  status: number | null
+  path: string
+  transient: boolean
+
+  constructor(message: string, options: { status?: number | null; path: string; transient: boolean }) {
+    super(message)
+    this.name = 'BrevoApiError'
+    this.status = options.status ?? null
+    this.path = options.path
+    this.transient = options.transient
+  }
+}
+
+export function isRetryableBrevoStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500
+}
+
+export function getBrevoRetryDelayMs(attempt: number): number {
+  return Math.min(250 * 2 ** attempt, 1500)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+export function formatBrevoError(error: unknown): string {
+  if (error instanceof BrevoApiError) return error.message
+  if (error instanceof Error) return error.message
+  return 'Unknown Brevo error'
+}
+
 // ── HTTP helper ───────────────────────────────────────────────────────────
 
 async function brevoFetch<T>(
@@ -64,25 +130,52 @@ async function brevoFetch<T>(
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' = 'GET',
   body?: unknown,
 ): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method,
-    headers: {
-      'api-key': BREVO_API_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    cache: 'no-store',
-  })
+  let lastError: unknown = null
 
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`Brevo API error [${res.status}] ${path}: ${text}`)
+  for (let attempt = 0; attempt < BREVO_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${BASE_URL}${path}`, {
+        method,
+        headers: {
+          'api-key': BREVO_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        cache: 'no-store',
+      })
+
+      if (!res.ok) {
+        const text = await res.text()
+        const error = new BrevoApiError(`Brevo API error [${res.status}] ${path}: ${text}`, {
+          status: res.status,
+          path,
+          transient: isRetryableBrevoStatus(res.status),
+        })
+
+        if (!error.transient || attempt === BREVO_MAX_ATTEMPTS - 1) {
+          throw error
+        }
+
+        lastError = error
+        await sleep(getBrevoRetryDelayMs(attempt))
+        continue
+      }
+
+      if (res.status === 204) return {} as T
+      return res.json() as Promise<T>
+    } catch (error) {
+      const retryable = error instanceof BrevoApiError ? error.transient : true
+      if (!retryable || attempt === BREVO_MAX_ATTEMPTS - 1) {
+        throw error
+      }
+
+      lastError = error
+      await sleep(getBrevoRetryDelayMs(attempt))
+    }
   }
 
-  // 204 No Content
-  if (res.status === 204) return {} as T
-  return res.json() as Promise<T>
+  throw lastError instanceof Error ? lastError : new Error('Brevo request failed')
 }
 
 // ── Contact operations ────────────────────────────────────────────────────
@@ -92,14 +185,27 @@ async function brevoFetch<T>(
  * Returns the Brevo contact ID.
  */
 export async function upsertBrevoContact(contact: BrevoContact): Promise<number | null> {
+  const result = await upsertBrevoContactResult(contact)
+  return result.id
+}
+
+export async function upsertBrevoContactResult(
+  contact: BrevoContact,
+): Promise<{ id: number | null; error: string | null }> {
   try {
     const result = await brevoFetch<{ id?: number }>('/contacts', 'POST', {
       ...contact,
       updateEnabled: true,
     })
-    return result.id ?? null
-  } catch {
-    return null
+    return {
+      id: result.id ?? null,
+      error: result.id ? null : 'Brevo did not return a contact id',
+    }
+  } catch (error) {
+    return {
+      id: null,
+      error: formatBrevoError(error),
+    }
   }
 }
 
@@ -192,19 +298,66 @@ export async function addToBrevoList(email: string, listId: number): Promise<boo
 
 // ── Webhook helpers ───────────────────────────────────────────────────────
 
+export async function listBrevoWebhooks(limit = 50): Promise<BrevoWebhookSummary[]> {
+  const safeLimit = Math.min(Math.max(limit, 1), 100)
+
+  const result = await brevoFetch<{
+    webhooks?: Array<{
+      id: number
+      url: string
+      description?: string
+      events?: string[]
+      type?: string
+      channel?: string
+    }>
+  }>(`/webhooks?limit=${safeLimit}&offset=0`)
+
+  return (result.webhooks || []).map((webhook) => ({
+    id: webhook.id,
+    url: webhook.url,
+    description: webhook.description ?? null,
+    events: webhook.events || [],
+    type: webhook.type ?? null,
+    channel: webhook.channel ?? null,
+  }))
+}
+
 /**
  * Register a webhook endpoint in Brevo.
  * Call this once during initial setup.
  */
-export async function registerBrevoWebhook(webhookUrl: string): Promise<{ id: number } | null> {
+export async function registerBrevoWebhook(
+  webhookUrl: string,
+): Promise<{ id: number; alreadyExists?: boolean } | null> {
+  try {
+    const existingWebhooks = await listBrevoWebhooks(100)
+    const existing = existingWebhooks.find((webhook) => webhook.url === webhookUrl)
+    if (existing) {
+      return { id: existing.id, alreadyExists: true }
+    }
+  } catch {
+    // Ignore list failures and still attempt create.
+  }
+
   try {
     return await brevoFetch<{ id: number }>('/webhooks', 'POST', {
       url: webhookUrl,
       description: 'xm-email engagement tracking',
-      events: ['delivered', 'opened', 'clicked', 'softBounce', 'hardBounce', 'unsubscribed', 'spam'],
-      type: 'marketing',
+      events: ['delivered', 'opened', 'click', 'softBounce', 'hardBounce', 'unsubscribed', 'spam'],
+      type: 'transactional',
     })
   } catch {
+    // Retry by checking whether webhook already exists now (e.g. duplicate URL race).
+    try {
+      const existingWebhooks = await listBrevoWebhooks(100)
+      const existing = existingWebhooks.find((webhook) => webhook.url === webhookUrl)
+      if (existing) {
+        return { id: existing.id, alreadyExists: true }
+      }
+    } catch {
+      // Ignore and return null below.
+    }
+
     return null
   }
 }
@@ -246,5 +399,145 @@ export function contactToBrevoAttributes(contact: {
     CUSTOMER_HEALTH:   contact.health_score ?? 0,
     SIGNUP_DATE:       contact.created_at?.slice(0, 10) || '',
     TAGS:              (contact.tags || []).join(', '),
+  }
+}
+
+// ── Template operations ───────────────────────────────────────────────────
+
+export async function listBrevoTemplates(limit = 50): Promise<BrevoTemplateSummary[]> {
+  const safeLimit = Math.min(Math.max(limit, 1), 100)
+
+  const result = await brevoFetch<{
+    templates?: Array<{
+      id: number
+      name: string
+      subject?: string | null
+      isActive?: boolean
+      modifiedAt?: string
+      createdAt?: string
+    }>
+  }>(`/smtp/templates?limit=${safeLimit}&offset=0&sort=desc`)
+
+  const templates = result.templates || []
+  return templates.map((template) => ({
+    id: template.id,
+    name: template.name,
+    subject: template.subject ?? null,
+    isActive: typeof template.isActive === 'boolean' ? template.isActive : null,
+    modifiedAt: template.modifiedAt ?? null,
+    createdAt: template.createdAt ?? null,
+  }))
+}
+
+async function createBrevoSmtpTemplate(input: BrevoSmtpTemplateUpsertInput): Promise<number> {
+  const result = await brevoFetch<{ id: number }>('/smtp/templates', 'POST', {
+    templateName: input.name,
+    subject: input.subject,
+    htmlContent: input.htmlContent,
+    sender: {
+      name: input.senderName,
+      email: input.senderEmail,
+    },
+    replyTo: input.replyToEmail
+      ? {
+          email: input.replyToEmail,
+          name: input.senderName,
+        }
+      : undefined,
+    isActive: true,
+  })
+
+  return result.id
+}
+
+async function updateBrevoSmtpTemplate(
+  templateId: number,
+  input: BrevoSmtpTemplateUpsertInput,
+): Promise<void> {
+  await brevoFetch(`/smtp/templates/${templateId}`, 'PUT', {
+    templateName: input.name,
+    subject: input.subject,
+    htmlContent: input.htmlContent,
+    sender: {
+      name: input.senderName,
+      email: input.senderEmail,
+    },
+    replyTo: input.replyToEmail
+      ? {
+          email: input.replyToEmail,
+          name: input.senderName,
+        }
+      : undefined,
+    isActive: true,
+  })
+}
+
+// ── Transactional email send ──────────────────────────────────────────────
+
+export interface BrevoTransactionalSendInput {
+  templateId: number
+  toEmail: string
+  toName?: string | null
+  params?: Record<string, string | number | null>
+  tags?: string[]
+}
+
+export interface BrevoTransactionalSendResult {
+  messageId: string
+}
+
+/**
+ * Send a transactional email via a pre-provisioned Brevo SMTP template.
+ * Used by the campaign execution engine to dispatch drip steps.
+ */
+export async function sendBrevoTransactionalEmail(
+  input: BrevoTransactionalSendInput,
+): Promise<BrevoTransactionalSendResult> {
+  const result = await brevoFetch<{ messageId: string }>('/smtp/email', 'POST', {
+    templateId: input.templateId,
+    to: [
+      {
+        email: input.toEmail,
+        name: input.toName || input.toEmail,
+      },
+    ],
+    params: input.params || {},
+    tags: input.tags || [],
+  })
+
+  return { messageId: result.messageId }
+}
+
+export async function upsertBrevoSmtpTemplate(
+  input: BrevoSmtpTemplateUpsertInput,
+): Promise<BrevoSmtpTemplateUpsertResult> {
+  let templateId = input.existingTemplateId ?? null
+
+  if (!templateId) {
+    const templates = await listBrevoTemplates(100)
+    const existing = templates.find((template) => template.name === input.name)
+    if (existing?.id) {
+      templateId = existing.id
+    }
+  }
+
+  if (templateId) {
+    try {
+      await updateBrevoSmtpTemplate(templateId, input)
+      return {
+        templateId,
+        created: false,
+      }
+    } catch (error) {
+      const missingTemplate = error instanceof BrevoApiError && error.status === 404
+      if (!missingTemplate) {
+        throw error
+      }
+    }
+  }
+
+  return {
+    templateId: await createBrevoSmtpTemplate(input),
+    created: true,
   }
 }

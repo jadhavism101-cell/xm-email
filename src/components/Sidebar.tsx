@@ -1,7 +1,7 @@
 'use client'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { motion } from 'framer-motion'
 
 const navCampaigns = [
@@ -69,6 +69,16 @@ const navCampaigns = [
 
 const navTools = [
   {
+    href: '/admin/campaigns/integrations',
+    label: 'Integration Health',
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+          d="M3.75 13.5 7.5 9.75l4.5 4.5 8.25-8.25M3.75 19.5h16.5" />
+      </svg>
+    ),
+  },
+  {
     href: '/admin/campaigns/enrichment',
     label: 'Enrichment Queue',
     icon: (
@@ -99,11 +109,9 @@ const navBottom = [
 export default function Sidebar() {
   const pathname = usePathname()
   const router = useRouter()
-  const [isLight, setIsLight] = useState(false)
-
-  useEffect(() => {
-    setIsLight(document.documentElement.classList.contains('light'))
-  }, [])
+  const [isLight, setIsLight] = useState(
+    () => typeof document !== 'undefined' && document.documentElement.classList.contains('light'),
+  )
 
   function toggleTheme() {
     const next = !isLight

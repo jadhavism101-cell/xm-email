@@ -135,6 +135,22 @@ export type CampaignAiSession = {
   updated_at: string
 }
 
+// ── admin_audit_log ───────────────────────────────────────────────────────
+
+export type AdminAuditLog = {
+  id: string
+  actor_id: string | null
+  actor_email: string
+  action: string
+  entity_type: string
+  entity_id: string | null
+  before_value: Record<string, unknown> | null
+  after_value: Record<string, unknown> | null
+  ip_address: string | null
+  notes: string | null
+  created_at: string
+}
+
 // ── xm-crm shared types (read-only from this module) ─────────────────────
 
 export type ContactType = 'lead' | 'customer'

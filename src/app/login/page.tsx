@@ -22,14 +22,18 @@ function LoginForm() {
       body: JSON.stringify({ password }),
     })
 
+    const data = await res.json().catch(() => null)
+
     if (res.ok) {
       const from = searchParams.get('from') || '/admin/campaigns'
       router.push(from)
     } else {
-      setError('Invalid password. Try again.')
+      setError(typeof data?.error === 'string' ? data.error : 'Invalid password. Try again.')
       setLoading(false)
     }
   }
+
+  const configError = searchParams.get('error') === 'config'
 
   return (
     <div className="min-h-screen bg-[#080C12] flex items-center justify-center p-4">
@@ -88,13 +92,13 @@ function LoginForm() {
               />
             </div>
 
-            {error && (
+            {(configError || error) && (
               <motion.p
                 initial={{ opacity: 0, y: -4 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="text-red-400 text-xs"
               >
-                {error}
+                  {error || 'Dashboard auth is not configured in this environment.'}
               </motion.p>
             )}
 

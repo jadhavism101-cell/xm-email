@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-
-const SESSION_SECRET = (process.env.SESSION_SECRET || 'xm-email-session-2026').trim()
+import { AUTH_COOKIE_NAME, getSessionSecretConfig } from '@/lib/auth-config'
 
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
@@ -11,8 +10,17 @@ export function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  const cookie = request.cookies.get('xm-auth')
-  if (cookie?.value === SESSION_SECRET) {
+  const sessionSecret = getSessionSecretConfig()
+  if (!sessionSecret.ok || !sessionSecret.value) {
+    const url = request.nextUrl.clone()
+    url.pathname = '/login'
+    url.searchParams.set('from', pathname)
+    url.searchParams.set('error', 'config')
+    return NextResponse.redirect(url)
+  }
+
+  const cookie = request.cookies.get(AUTH_COOKIE_NAME)
+  if (cookie?.value === sessionSecret.value) {
     return NextResponse.next()
   }
 

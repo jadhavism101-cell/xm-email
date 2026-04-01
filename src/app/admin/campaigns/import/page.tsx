@@ -1,5 +1,5 @@
 'use client'
-import { useState, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 
 export const dynamic = 'force-dynamic'
@@ -24,7 +24,14 @@ interface MetabaseImportResult {
   ok: boolean
   summary: { total_vendors_fetched: number; created: number; updated: number; skipped: number; errors: number; batch_name: string }
   segments: { active_customer: number; lapsed_customer: number; never_ordered: number }
+  error?: string
   errors?: string[]
+}
+
+interface CampaignListItem {
+  id: string
+  title: string
+  status: string
 }
 
 // ── Step indicator ──────────────────────────────────────────────────────────
@@ -91,7 +98,37 @@ export default function ImportPage() {
   const [metaResult, setMetaResult] = useState<MetabaseImportResult | null>(null)
   const [syncingBrevo, setSyncingBrevo] = useState(false)
   const [brevoSynced, setBrevoSynced] = useState(false)
+  const [campaigns, setCampaigns] = useState<CampaignListItem[]>([])
+  const [selectedCampaignId, setSelectedCampaignId] = useState('')
+  const [loadingCampaigns, setLoadingCampaigns] = useState(false)
+  const [enrolling, setEnrolling] = useState(false)
+  const [enrollMessage, setEnrollMessage] = useState('')
+  const [enrollError, setEnrollError] = useState('')
+  const [importError, setImportError] = useState('')
+  const [syncMessage, setSyncMessage] = useState('')
+  const [syncError, setSyncError] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    async function loadCampaigns() {
+      setLoadingCampaigns(true)
+      try {
+        const res = await fetch('/api/campaigns?limit=100', { cache: 'no-store' })
+        const data = await res.json()
+        if (!res.ok || !data?.ok || !Array.isArray(data.items)) return
+        const items = data.items as CampaignListItem[]
+        setCampaigns(items)
+        if (!selectedCampaignId && items.length > 0) {
+          setSelectedCampaignId(items[0].id)
+        }
+      } finally {
+        setLoadingCampaigns(false)
+      }
+    }
+
+    loadCampaigns()
+    // Load campaign options once on initial render.
+  }, [])
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault(); setDragOver(false)
@@ -102,38 +139,131 @@ export default function ImportPage() {
   async function handleCSVUpload() {
     if (!file) return
     setLoading(true)
+    setImportError('')
     const fd = new FormData()
     fd.append('file', file)
     fd.append('batch_name', batchName)
     fd.append('source', 'csv_import')
-    const res = await fetch('/api/contacts/import-csv', { method: 'POST', body: fd })
-    const data: CSVImportResult = await res.json()
-    setCsvResult(data)
-    setLoading(false)
-    if (data.ok || data.stats?.valid > 0) setStep(2)
+    try {
+      const res = await fetch('/api/contacts/import-csv', { method: 'POST', body: fd })
+      const data: CSVImportResult = await res.json()
+      setCsvResult(data)
+
+      if (!res.ok || !data.ok) {
+        setImportError(data.error || 'CSV import failed')
+      }
+
+      if (data.ok || data.stats?.valid > 0 || data.stats?.created > 0) {
+        setStep(2)
+      }
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'CSV import failed')
+    } finally {
+      setLoading(false)
+    }
   }
 
   async function handleMetabaseImport() {
     setLoading(true)
-    const res = await fetch('/api/contacts/import-metabase', { method: 'POST' })
-    const data: MetabaseImportResult = await res.json()
-    setMetaResult(data)
-    setLoading(false)
-    setStep(3)
+    setImportError('')
+    try {
+      const res = await fetch('/api/contacts/import-metabase', { method: 'POST' })
+      const data: MetabaseImportResult = await res.json()
+      setMetaResult(data)
+
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || 'Metabase import failed')
+      }
+
+      setStep(3)
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Metabase import failed')
+    } finally {
+      setLoading(false)
+    }
   }
 
-  async function handleSyncBrevo() {
+  async function handleSyncBrevo(batch: string) {
+    if (!batch) {
+      setSyncError('Import batch is missing. Re-run the import and try again.')
+      return
+    }
+
     setSyncingBrevo(true)
-    await fetch('/api/contacts/sync-brevo', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ segment: null }),
-    })
-    setSyncingBrevo(false)
-    setBrevoSynced(true)
+    setSyncMessage('')
+    setSyncError('')
+
+    try {
+      const res = await fetch('/api/contacts/sync-brevo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_name: batch }),
+      })
+      const data = await res.json()
+
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || 'Brevo sync failed')
+      }
+
+      const synced = Number(data.synced || 0)
+      const total = Number(data.total || 0)
+      const failed = Array.isArray(data.errors) ? data.errors.length : 0
+
+      if (failed > 0 && synced < total) {
+        setBrevoSynced(false)
+        setSyncError(`Brevo sync partially completed: ${synced} of ${total} contacts synced. Retry to pick up the remaining contacts.`)
+      } else {
+        setBrevoSynced(true)
+        setSyncMessage(total > 0 ? `Synced ${synced} of ${total} contacts to Brevo.` : 'No contacts in this batch needed syncing.')
+      }
+    } catch (err) {
+      setBrevoSynced(false)
+      setSyncError(err instanceof Error ? err.message : 'Brevo sync failed')
+    } finally {
+      setSyncingBrevo(false)
+    }
   }
 
-  function reset() { setMode(null); setStep(0); setFile(null); setCsvResult(null); setMetaResult(null); setBrevoSynced(false) }
+  async function handleEnrollImportedContacts(batch: string) {
+    if (!selectedCampaignId || !batch) return
+    setEnrolling(true)
+    setEnrollError('')
+    setEnrollMessage('')
+
+    try {
+      const res = await fetch(`/api/campaigns/${selectedCampaignId}/enroll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_name: batch }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || 'Enrollment failed')
+      }
+
+      const enrolled = Number(data.enrolled || 0)
+      const skipped = Number(data.skipped || 0)
+      setEnrollMessage(`Enrollment complete: ${enrolled} enrolled, ${skipped} skipped.`)
+    } catch (err) {
+      setEnrollError(err instanceof Error ? err.message : 'Enrollment failed')
+    } finally {
+      setEnrolling(false)
+    }
+  }
+
+  function reset() {
+    setMode(null)
+    setStep(0)
+    setFile(null)
+    setCsvResult(null)
+    setMetaResult(null)
+    setBrevoSynced(false)
+    setImportError('')
+    setEnrollError('')
+    setEnrollMessage('')
+    setSyncMessage('')
+    setSyncError('')
+  }
 
   const steps = mode === 'metabase' ? STEPS_META : STEPS_CSV
 
@@ -294,6 +424,11 @@ export default function ImportPage() {
                 {/* Step 2: Results */}
                 {step === 2 && csvResult && (
                   <div className="space-y-6">
+                    {importError && (
+                      <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-sm text-amber-300">
+                        {importError}
+                      </div>
+                    )}
                     <div className="grid grid-cols-4 gap-3">
                       <StatPill label="Valid emails" value={csvResult.stats.valid} color="emerald" />
                       <StatPill label="New contacts" value={csvResult.stats.created} color="blue" />
@@ -347,8 +482,14 @@ export default function ImportPage() {
                   <div className="space-y-6">
                     <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-3">
                       <p className="text-white font-medium text-sm">Sync new contacts to Brevo</p>
-                      <p className="text-gray-500 text-sm">This will push all newly created contacts to your Brevo account, add them to the correct lists, and make them available for campaign enrollment.</p>
-                      {brevoSynced && (
+                      <p className="text-gray-500 text-sm">This will push contacts from this import batch to your Brevo account, add them to the correct lists, and make them available for campaign enrollment.</p>
+                      {syncMessage && (
+                        <div className="text-emerald-400 text-sm">{syncMessage}</div>
+                      )}
+                      {syncError && (
+                        <div className="text-amber-300 text-sm">{syncError}</div>
+                      )}
+                      {brevoSynced && !syncError && (
                         <div className="flex items-center gap-2 text-emerald-400 text-sm">
                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                             <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -359,7 +500,7 @@ export default function ImportPage() {
                     </div>
                     <div className="flex gap-3">
                       {!brevoSynced && (
-                        <button onClick={handleSyncBrevo} disabled={syncingBrevo}
+                        <button onClick={() => csvResult && handleSyncBrevo(csvResult.batch_name)} disabled={syncingBrevo || !csvResult}
                           className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 text-white text-sm font-semibold
                                      disabled:opacity-40 hover:from-blue-500 hover:to-violet-500 transition-all duration-150 shadow-lg shadow-blue-600/20 flex items-center gap-2">
                           {syncingBrevo ? (
@@ -370,6 +511,37 @@ export default function ImportPage() {
                       <button onClick={reset} className="px-4 py-2 rounded-xl border border-white/[0.08] text-gray-400 text-sm hover:text-white transition-all">
                         {brevoSynced ? 'Import another file' : 'Skip & finish'}
                       </button>
+                    </div>
+
+                    <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-3">
+                      <p className="text-gray-300 text-sm font-medium">Optional: Enroll this imported batch into a campaign</p>
+                      <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                        <select
+                          value={selectedCampaignId}
+                          onChange={(e) => setSelectedCampaignId(e.target.value)}
+                          disabled={loadingCampaigns || campaigns.length === 0}
+                          className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white"
+                        >
+                          {campaigns.length === 0 ? (
+                            <option value="">{loadingCampaigns ? 'Loading campaigns...' : 'No campaigns found'}</option>
+                          ) : (
+                            campaigns.map((campaign) => (
+                              <option key={campaign.id} value={campaign.id}>
+                                {campaign.title} ({campaign.status})
+                              </option>
+                            ))
+                          )}
+                        </select>
+                        <button
+                          onClick={() => csvResult && handleEnrollImportedContacts(csvResult.batch_name)}
+                          disabled={!csvResult || !selectedCampaignId || enrolling}
+                          className="px-4 py-2 rounded-xl border border-white/[0.1] bg-white/[0.04] text-white text-sm font-medium disabled:opacity-50"
+                        >
+                          {enrolling ? 'Enrolling...' : 'Enroll imported contacts'}
+                        </button>
+                      </div>
+                      {enrollMessage && <p className="text-emerald-400 text-xs">{enrollMessage}</p>}
+                      {enrollError && <p className="text-red-400 text-xs">{enrollError}</p>}
                     </div>
                   </div>
                 )}
@@ -428,6 +600,11 @@ export default function ImportPage() {
                 {/* Step 1: Running */}
                 {step === 1 && (
                   <div className="space-y-5">
+                    {importError && (
+                      <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-sm text-red-300">
+                        {importError}
+                      </div>
+                    )}
                     <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-6 flex flex-col items-center justify-center text-center gap-4 min-h-[180px]">
                       {loading ? (
                         <>
@@ -456,6 +633,11 @@ export default function ImportPage() {
                 {/* Step 3: Done */}
                 {step === 3 && metaResult && (
                   <div className="space-y-6">
+                    {importError && (
+                      <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-sm text-amber-300">
+                        {importError}
+                      </div>
+                    )}
                     <div className="grid grid-cols-4 gap-3">
                       <StatPill label="Fetched from Metabase" value={metaResult.summary.total_vendors_fetched} color="blue" />
                       <StatPill label="New contacts created" value={metaResult.summary.created} color="emerald" />
@@ -480,16 +662,67 @@ export default function ImportPage() {
                     </div>
 
                     <div className="flex gap-3">
-                      <button onClick={handleSyncBrevo} disabled={syncingBrevo || brevoSynced}
+                      <button onClick={() => handleSyncBrevo(metaResult.summary.batch_name)} disabled={syncingBrevo || brevoSynced}
                         className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 text-white text-sm font-semibold
                                    disabled:opacity-40 hover:from-blue-500 hover:to-violet-500 transition-all duration-150 shadow-lg shadow-blue-600/20 flex items-center gap-2">
                         {syncingBrevo ? (
                           <><svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Syncing to Brevo…</>
-                        ) : brevoSynced ? '✓ Synced to Brevo' : 'Sync all to Brevo'}
+                        ) : brevoSynced ? '✓ Synced to Brevo' : 'Sync imported batch to Brevo'}
                       </button>
                       <button onClick={reset} className="px-4 py-2 rounded-xl border border-white/[0.08] text-gray-400 text-sm hover:text-white transition-all">
                         Done
                       </button>
+                    </div>
+
+                    {(syncMessage || syncError) && (
+                      <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-2">
+                        {syncMessage && <p className="text-emerald-400 text-sm">{syncMessage}</p>}
+                        {syncError && <p className="text-amber-300 text-sm">{syncError}</p>}
+                      </div>
+                    )}
+
+                    {Array.isArray(metaResult.errors) && metaResult.errors.length > 0 && (
+                      <details className="rounded-xl border border-amber-500/15 bg-amber-600/[0.03] p-4">
+                        <summary className="text-amber-300 text-xs font-medium cursor-pointer">
+                          {metaResult.errors.length} import warnings (click to expand)
+                        </summary>
+                        <div className="mt-3 space-y-1 max-h-40 overflow-y-auto">
+                          {metaResult.errors.slice(0, 20).map((item, index) => (
+                            <p key={index} className="text-gray-400 text-xs">{item}</p>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+
+                    <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-3">
+                      <p className="text-gray-300 text-sm font-medium">Optional: Enroll this imported batch into a campaign</p>
+                      <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                        <select
+                          value={selectedCampaignId}
+                          onChange={(e) => setSelectedCampaignId(e.target.value)}
+                          disabled={loadingCampaigns || campaigns.length === 0}
+                          className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white"
+                        >
+                          {campaigns.length === 0 ? (
+                            <option value="">{loadingCampaigns ? 'Loading campaigns...' : 'No campaigns found'}</option>
+                          ) : (
+                            campaigns.map((campaign) => (
+                              <option key={campaign.id} value={campaign.id}>
+                                {campaign.title} ({campaign.status})
+                              </option>
+                            ))
+                          )}
+                        </select>
+                        <button
+                          onClick={() => handleEnrollImportedContacts(metaResult.summary.batch_name)}
+                          disabled={!selectedCampaignId || enrolling}
+                          className="px-4 py-2 rounded-xl border border-white/[0.1] bg-white/[0.04] text-white text-sm font-medium disabled:opacity-50"
+                        >
+                          {enrolling ? 'Enrolling...' : 'Enroll imported contacts'}
+                        </button>
+                      </div>
+                      {enrollMessage && <p className="text-emerald-400 text-xs">{enrollMessage}</p>}
+                      {enrollError && <p className="text-red-400 text-xs">{enrollError}</p>}
                     </div>
                   </div>
                 )}

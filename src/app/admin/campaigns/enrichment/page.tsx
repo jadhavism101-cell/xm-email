@@ -45,7 +45,12 @@ export default function EnrichmentQueuePage() {
     setLoading(false)
   }, [statusFilter])
 
-  useEffect(() => { load(1) }, [load])
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void load(1)
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [load])
 
   async function handleSave(action: 'enriched' | 'skipped') {
     if (!activeItem) return

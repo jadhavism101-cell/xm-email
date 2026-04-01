@@ -1,13 +1,24 @@
 import { NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase'
 import {
-  upsertBrevoContact,
-  batchImportBrevoContacts,
+  upsertBrevoContactResult,
   contactToBrevoAttributes,
   BREVO_LISTS,
 } from '@/lib/brevo'
+import { requireDashboardRole } from '@/lib/api-security'
 
 export const dynamic = 'force-dynamic'
+
+function buildSyncMetadata(
+  current: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...current,
+    ...patch,
+  }
+}
 
 /**
  * POST /api/contacts/sync-brevo
@@ -15,14 +26,32 @@ export const dynamic = 'force-dynamic'
  * Syncs contacts from Supabase → Brevo.
  * Body (optional):
  *   { contact_ids?: string[] }   — sync specific contacts
+ *   { batch_name?: string }      — sync contacts from one import batch
  *   { segment?: string }         — 'active_customer' | 'lapsed_customer' | 'warm_lead' | 'new_cold'
  *   {}                           — sync all un-synced or recently-updated contacts
  */
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
+  const forbidden = requireDashboardRole(req, 'ops')
+  if (forbidden) return forbidden
+
   const body = await req.json().catch(() => ({}))
-  const { contact_ids, segment } = body as { contact_ids?: string[]; segment?: string }
+  const { contact_ids, batch_name, segment } = body as {
+    contact_ids?: string[]
+    batch_name?: string
+    segment?: string
+  }
 
   const supabase = getSupabaseAdmin()
+
+  if (contact_ids != null && (!Array.isArray(contact_ids) || contact_ids.some((item) => typeof item !== 'string'))) {
+    return NextResponse.json({ ok: false, error: 'contact_ids must be an array of strings' }, { status: 400 })
+  }
+  if (batch_name != null && typeof batch_name !== 'string') {
+    return NextResponse.json({ ok: false, error: 'batch_name must be a string' }, { status: 400 })
+  }
+  if (segment != null && typeof segment !== 'string') {
+    return NextResponse.json({ ok: false, error: 'segment must be a string' }, { status: 400 })
+  }
 
   // ── Build query ─────────────────────────────────────────────────────────
   let query = supabase
@@ -38,9 +67,11 @@ export async function POST(req: Request) {
 
   if (contact_ids && contact_ids.length > 0) {
     query = query.in('id', contact_ids)
+  } else if (batch_name) {
+    query = query.eq('import_batch', batch_name)
   } else if (segment) {
-    // Filter by segment tag in custom_fields
-    query = query.contains('tags', [segment])
+    // Filter by canonical segment field in custom_fields.
+    query = query.contains('custom_fields', { segment })
   } else {
     // Sync contacts without a brevo_contact_id yet (un-synced)
     query = query.is('brevo_contact_id', null)
@@ -95,50 +126,68 @@ export async function POST(req: Request) {
       }),
       listIds: [listId, BREVO_LISTS.ALL_CONTACTS],
       _contactId: c.id,
+      _customFields: customFields,
     }
   })
 
-  // ── Batch import to Brevo ────────────────────────────────────────────────
-  // Use batch import for efficiency, then update brevo_contact_id individually
+  // ── Sync to Brevo ────────────────────────────────────────────────────────
+  // Use per-contact upsert to persist real Brevo contact IDs (no sentinel writes).
   const CHUNK = 200
   let totalSynced = 0
-  const errors: string[] = []
+  const errors: Array<{ email: string; error: string }> = []
 
   for (let i = 0; i < brevoContacts.length; i += CHUNK) {
     const chunk = brevoContacts.slice(i, i + CHUNK)
 
-    // For batch import we don't get back individual IDs, so use individual upsert
-    // for the first 50, batch import for the rest
-    if (chunk.length <= 50) {
-      for (const bc of chunk) {
-        const brevoId = await upsertBrevoContact({
-          email: bc.email,
-          attributes: bc.attributes,
-          listIds: bc.listIds,
-          updateEnabled: true,
+    for (const bc of chunk) {
+      const attemptAt = new Date().toISOString()
+
+      const syncResult = await upsertBrevoContactResult({
+        email: bc.email,
+        attributes: bc.attributes,
+        listIds: bc.listIds,
+        updateEnabled: true,
+      })
+
+      const brevoId = syncResult.id
+
+      if (brevoId) {
+        const nextCustomFields = buildSyncMetadata(bc._customFields, {
+          brevo_sync_status: 'ok',
+          brevo_last_sync_attempt_at: attemptAt,
+          brevo_synced_at: attemptAt,
+          brevo_last_sync_error: null,
+          brevo_last_sync_error_at: null,
+          brevo_last_sync_lists: bc.listIds,
         })
-        if (brevoId) {
-          await supabase
-            .from('contacts')
-            .update({ brevo_contact_id: brevoId })
-            .eq('id', bc._contactId)
-          totalSynced++
-        } else {
-          errors.push(bc.email)
-        }
-      }
-    } else {
-      const result = await batchImportBrevoContacts(
-        chunk.map(({ _contactId: _, ...rest }) => rest),
-        [BREVO_LISTS.ALL_CONTACTS],
-      )
-      if (result?.processId) {
-        // Mark contacts as synced (no individual IDs from batch)
-        const ids = chunk.map(c => c._contactId)
-        await supabase.from('contacts').update({ brevo_contact_id: -1 }).in('id', ids)
-        totalSynced += chunk.length
+
+        await supabase
+          .from('contacts')
+          .update({
+            brevo_contact_id: brevoId,
+            custom_fields: nextCustomFields,
+            updated_at: attemptAt,
+          })
+          .eq('id', bc._contactId)
+        totalSynced++
       } else {
-        errors.push(`Batch ${i / CHUNK + 1} failed`)
+        const nextCustomFields = buildSyncMetadata(bc._customFields, {
+          brevo_sync_status: 'error',
+          brevo_last_sync_attempt_at: attemptAt,
+          brevo_last_sync_error: syncResult.error || 'upsert_failed',
+          brevo_last_sync_error_at: attemptAt,
+          brevo_last_sync_lists: bc.listIds,
+        })
+
+        await supabase
+          .from('contacts')
+          .update({
+            custom_fields: nextCustomFields,
+            updated_at: attemptAt,
+          })
+          .eq('id', bc._contactId)
+
+        errors.push({ email: bc.email, error: syncResult.error || 'upsert_failed' })
       }
     }
   }
@@ -147,6 +196,8 @@ export async function POST(req: Request) {
     ok: true,
     synced: totalSynced,
     total: contacts.length,
+    failed: errors.length,
+    batch_name: batch_name || null,
     errors: errors.length > 0 ? errors.slice(0, 20) : undefined,
   })
 }

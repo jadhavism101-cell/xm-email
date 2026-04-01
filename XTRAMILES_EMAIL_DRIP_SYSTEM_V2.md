@@ -24,8 +24,8 @@ All three share the same Supabase database, auth system, role model, UI componen
 
 The drip module does NOT build its own:
 
-- **Auth** — uses existing Supabase Auth. Same login, same session, same middleware.
-- **Role model** — uses the existing 5-role matrix (super_admin, admin, ops_manager, sales_manager, finance). Campaign management access: `super_admin`, `admin`, `sales_manager`.
+- **Auth** — current implementation uses a dashboard password gate that issues secure session and role cookies (`xm-auth`, `xm-role`) with middleware protection.
+- **Role model** — xm-email currently enforces the dashboard role model `admin > ops > sales > seller > viewer` via secure cookies and route-level guards.
 - **UI shell** — sits inside the existing admin panel layout. Collapsible sidebar gets a new "Campaigns" section. Same breadcrumbs, same top bar, same notification bell.
 - **Component library** — uses whatever is already set up (shadcn/ui, custom components). No new design system.
 - **Audit logging** — all campaign actions (create, edit, activate, pause, delete) log to the existing `admin_audit_log` table with the same `(actor_id, action, entity_type, entity_id, before_state, after_state)` pattern.
@@ -101,13 +101,36 @@ Follow the existing xm-dash API pattern. If the project uses Next.js API routes:
 /api/campaigns/            — CRUD for drip_campaigns
 /api/campaigns/[id]/deploy — push to Brevo
 /api/campaigns/[id]/pause  — pause in Brevo
-/api/campaigns/ai-builder  — Claude API proxy for campaign generation
+/api/campaigns/ai-builder  — Gemini API proxy for campaign generation
+/api/campaigns/settings    — campaign/Brevo settings read-write
+/api/campaigns/settings/test — Brevo API key test endpoint
+/api/campaigns/templates   — list Brevo templates
 /api/webhooks/brevo        — Brevo engagement webhook receiver
+/api/webhooks/brevo/register — idempotent Brevo webhook registration
 /api/contacts/sync-brevo   — manual trigger for contact sync
 /api/contacts/import-csv   — CSV upload + segmentation + routing
+/api/contacts/import-metabase — import and segment from Metabase
+/api/contacts/segment-counts — canonical segment population counts
+/api/integrations/brevo/observability — sync and webhook health metrics
 ```
 
-All routes protected by existing auth middleware + role check. All writes logged to `admin_audit_log`.
+All routes are protected by dashboard session auth, with route-level role checks for write operations (campaign mutations require at least `sales`; import/sync/settings mutations require at least `ops`).
+
+Current deploy behavior: `POST /api/campaigns/[id]/deploy` now provisions a Brevo template pack (one managed SMTP template per campaign step), stores template IDs in `drip_campaigns.performance_data.brevo_deployment`, and sets `brevo_automation_id` to a deterministic deployment handle (`template-pack:<campaign_id>`).
+
+Required env for deploy provisioning: `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` (plus optional `BREVO_SENDER_NAME`, `BREVO_REPLY_TO_EMAIL`).
+
+Audit note: campaign actions log to `admin_audit_log` (primary) with `campaign_ai_sessions` as fallback. ✅ **Fully migrated 2026-03-30.**
+
+AI Builder exports: JSON (raw payload), Markdown (structured campaign spec), PDF (print dialog). ✅ **Implemented 2026-03-30.**
+
+Campaign step dispatch: `campaign-scheduler.ts` runs hourly via Vercel cron (`/api/campaigns/execute`), sends due steps via Brevo transactional API using provisioned template IDs, deduplicates via `activities` table. ✅ **Implemented 2026-03-30.** Requires `CRON_SECRET` env var.
+
+Empty-content guard: preflight now rejects deployment if any step has an empty `content_outline` (promoted from warning to error). Scheduler also skips sends for steps with no real content, guarding against any pre-existing empty templates. ✅ **Implemented 2026-03-30.**
+
+Daily send cap: scheduler reads `MAX_SENDS_PER_DAY` env var (default 290 — headroom under Brevo free tier 300/day limit). Raise after upgrading Brevo plan. Set to 2000+ on Starter/Business. ✅ **Implemented 2026-03-30.**
+
+Campaign 5 — Cold-to-Warm: 6-step drip for all 20k+ cold CSV contacts (D2C sellers on competitor platforms). Sequence: immediate intro → hidden costs education → case study → free audit offer → shipping metrics education → breakup email. Seed script: `scripts/seed_campaign5.sql`. Enrollment script: `scripts/enroll_campaign5.sql`. ✅ **Sequence written 2026-03-30. Deploy + enroll pending Brevo plan upgrade.**
 
 ---
 
@@ -192,7 +215,9 @@ Register webhooks in Brevo for engagement events. These fire back to xm-crm so e
 
 **Webhook endpoint:** `POST /api/webhooks/brevo` (same Next.js API route pattern as other xm-dash webhooks)
 
-**Events to subscribe:** `delivered`, `opened`, `clicked`, `soft_bounce`, `hard_bounce`, `unsubscribed`, `spam`
+**Recommended registration flow:** `POST /api/webhooks/brevo/register` (authenticated dashboard route, idempotent)
+
+**Events to subscribe:** `delivered`, `opened`, `clicked`, `softBounce`, `hardBounce`, `unsubscribed`, `spam`
 
 **Webhook processing logic:**
 1. Verify webhook signature (Brevo sends a secret header)
@@ -531,13 +556,13 @@ WHEN ASKED TO WRITE FULL EMAIL COPY:
 
 ### 4.3 Integration Phases
 
-**Phase 1 (Start here):** Chat interface at `/admin/campaigns/ai-builder`. Calls Claude API with the system prompt above. AI generates campaign spec as structured output. Human reviews, then manually creates automation in Brevo.
+**Phase 1 (Start here):** Chat interface at `/admin/campaigns/ai-builder`. Calls Gemini API (via server route) with the system prompt above. AI generates campaign spec as structured output. Human reviews, then manually creates automation in Brevo.
 
 **Phase 2:** AI generates structured JSON → "Deploy to Brevo" button → automation created in Brevo (paused) → human activates.
 
 **Phase 3:** AI monitors `drip_campaigns.performance_data` → proactively suggests optimizations → human approves → auto-deployed.
 
-### 4.4 Claude Code Prompt — Build the Agent Interface
+### 4.4 Implementation Prompt — Build the Agent Interface
 
 ```
 TASK: Build an AI Campaign Builder page within the existing xm-dash admin panel.
@@ -551,7 +576,7 @@ ROUTE: /admin/campaigns/ai-builder
 WHAT TO BUILD:
 
 1. Chat-style interface where the user describes a campaign in plain language
-2. Calls Claude API via Next.js API route (/api/campaigns/ai-builder) with system prompt
+2. Calls Gemini API via Next.js API route (`/api/campaigns/ai-builder`) with system prompt
 3. AI response rendered as formatted campaign spec (not raw JSON)
 4. User can:
    - Iterate ("make email #3 more urgent", "add a branch for non-openers")
@@ -572,7 +597,7 @@ UI:
 SCHEMA: Use the drip_campaigns and campaign_ai_sessions tables defined in the
 XTRAMILES_EMAIL_DRIP_SYSTEM docs.
 
-ACCESS: super_admin, admin, sales_manager only (use existing role middleware)
+ACCESS: admin, ops, and sales according to route permissions (use existing role middleware)
 
 AUDIT: Log all saves/edits to admin_audit_log (same pattern as rest of admin panel)
 
@@ -624,6 +649,20 @@ DO NOT:
 | Bi-weekly | Conversion rate per campaign | Adjust targeting/sequence |
 | Monthly | Campaign ROI, cohort analysis | Archive losers, scale winners |
 
+### 5.5 Post-Deploy Smoke Checklist
+
+Use this checklist after every production deploy:
+
+1. Run `npm run smoke:prod` (or `npm run release:prod` to deploy + verify in one command).
+2. Confirm protected routes reject unauthenticated access:
+   - `POST /api/webhooks/brevo/register` → `401`
+   - `GET /api/campaigns` → `401`
+   - `GET /api/integrations/brevo/observability` → `401`
+   - `POST /api/campaigns/ai-builder` → `401`
+3. Confirm route existence/method constraints:
+   - `GET /api/webhooks/brevo/register` → `405`
+4. If any check fails, treat deploy as incomplete and fix before sign-off.
+
 ---
 
 ## PART 6: FUTURE — ADDING WHATSAPP DRIP
@@ -656,7 +695,7 @@ Email sent → Wait 48h → Opened?
 | Day 3 | Set up Brevo → CRM webhook + activity logging | xm-crm activities table |
 | Day 4 | Create Campaign 1 (Lead Nurturing) in Brevo | Brevo account ready |
 | Day 5 | Create Campaign 1B (Warm Lead Activation) in Brevo | Brevo account ready |
-| Day 6 | Build AI Campaign Builder page in xm-dash | Claude API key |
+| Day 6 | Build AI Campaign Builder page in xm-dash | Gemini API key |
 | Day 7 | Build Import & Segment tool at /admin/campaigns/import | xm-crm contacts table |
 | Day 8 | Test Campaign 1 with small segment, monitor deliverability | Live contacts |
 | Week 2 | Segment existing user base, enroll in appropriate campaigns | Segmentation queries |
@@ -664,6 +703,12 @@ Email sent → Wait 48h → Opened?
 | Week 3 | Import old CSV user base via Import tool | CSV file, verification |
 | Week 3 | Review performance, use AI agent to optimize | Performance data |
 | Month 2 | Build semi-automated Brevo deployment (Phase 2) | Campaign validation |
+| Month 2 (Done) | Deploy endpoint provisions Brevo step template packs and persists deployment manifest | BREVO_API_KEY + sender profile env |
+| 2026-03-30 (Done) | Phase 3A: Audit sink migrated to admin_audit_log | — |
+| 2026-03-30 (Done) | Phase 3B: AI builder export parity (MD, PDF, JSON) | — |
+| 2026-03-30 (Done) | Phase 3C: Hourly scheduler + Vercel cron + anti-double-send | CRON_SECRET env var |
+| 2026-03-30 (Done) | Phase 3D: Empty email guard (preflight + scheduler), daily cap, Campaign 5 sequence | MAX_SENDS_PER_DAY env var |
+| Next | Upgrade Brevo plan → bump MAX_SENDS_PER_DAY → deploy + enroll Campaign 5 (20k contacts) | Brevo paid plan |
 | Month 3 | Add WhatsApp drip channel | WhatsApp Business API |
 
 ---
@@ -692,5 +737,8 @@ GET /contacts/{email}
 # Webhooks
 POST /webhooks
 { "url": "https://app.xtramiles.com/api/webhooks/brevo",
-  "events": ["delivered","opened","clicked","hardBounce","unsubscribed","spam"] }
+   "events": ["delivered","opened","clicked","softBounce","hardBounce","unsubscribed","spam"] }
+
+# Register webhook from xm-email dashboard
+POST /api/webhooks/brevo/register
 ```
